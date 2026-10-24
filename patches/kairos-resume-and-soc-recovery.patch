@@ -1,0 +1,171 @@
+diff -ruN a/src/MPC_costfunction.py b/src/MPC_costfunction.py
+--- a/src/MPC_costfunction.py	2026-10-24 09:18:42.983584952 +0200
++++ b/src/MPC_costfunction.py	2026-10-24 09:18:42.985756622 +0200
+@@ -124,6 +124,8 @@
+         # constant tightening of the SoC limits (SoC fraction), independent of the forecast uncertainty;
+         # the "constant back-off" baseline of the deterministic MPC
+         "soc_backoff": float(mpc.get("soc_backoff", 0.0) or 0.0),
++        # relax the SoC band where it cannot be reached from the current SoC (start outside the band)
++        "soc_recovery": bool(mpc.get("soc_recovery", True)),
+         # uncertainty handling (defaults = original formulation)
+         "unc_scaling": mpc.get("uncertainty_scaling", "absolute"),
+         "sigma_ref": sigma_reference_w(config),
+@@ -429,6 +431,37 @@
+     return np.vstack([J_soc, -J_soc])
+ 
+ 
++def recovery_relaxation(horizon_dataframe, config, x_0, dis_lower, dis_upper, charge_max):
++    """How far the SoC band has to be relaxed at each step so that it can be reached from x_0.
++
++    After a disturbance the measured SoC can start below the lower (or above the upper) effective limit.
++    The band constraints are then infeasible for the first steps and the solver fails. Instead, the
++    band at step i is lowered to the highest SoC reachable by step i (no discharge beyond what the
++    grid limit forces, full charging), so the plan returns to the band as fast as the battery allows
++    and keeps the band from then on. Zero wherever the band is reachable, i.e. in normal operation.
++    Returns (relax_low, relax_up), both >= 0, added to the lower and upper constraint values.
++    """
++    p = _mpc_params(config)
++    N = len(horizon_dataframe)
++    if not p["soc_recovery"]:
++        return np.zeros(N), np.zeros(N)
++    k_ch = p["eta"] * p["dt_h"] / p["e_cap"]
++    k_dis = p["dt_h"] / (p["eta"] * p["e_cap"])
++    m_low, m_up = soc_margins(horizon_dataframe, config)
++    ch_min = np.zeros(N) if p["charge_is_decision"] else np.asarray(charge_max, dtype=float)
++    soc_highest = x_0 + np.cumsum(k_ch * np.asarray(charge_max, dtype=float) - k_dis * dis_lower)
++    soc_lowest = x_0 + np.cumsum(k_ch * ch_min - k_dis * dis_upper)
++    tol = 1e-6
++    relax_low = np.clip((p["soc_min"] + m_low) - soc_highest + tol, 0.0, None)
++    relax_up = np.clip(soc_lowest - (p["soc_max"] - m_up) + tol, 0.0, None)
++    # once the band is reachable it stays enforced: the relaxation can only shrink along the horizon
++    relax_low = np.minimum.accumulate(relax_low)
++    relax_up = np.minimum.accumulate(relax_up)
++    relax_low[relax_low <= tol] = 0.0
++    relax_up[relax_up <= tol] = 0.0
++    return relax_low, relax_up
++
++
+ def optimize(horizon_dataframe, config, x_0=None, init=None):
+     """Solve the MPC problem. init: optional starting point {"dis": W array, "charge": W array}
+     (e.g. the previous plan shifted by one step); by default the solver starts from no discharge
+@@ -476,9 +509,12 @@
+             return r["cost"], np.concatenate([grad_d, r["grad_charge"] * s_ch])
+         return r["cost"], grad_d
+ 
++    relax_low, relax_up = recovery_relaxation(horizon_dataframe, config, x_0, lower, upper, charge_max)
++    relax = np.concatenate([relax_low, relax_up])
++
+     def soc_con(z):
+         u, c = split(z)
+-        return soc_bounds_constraint(u, horizon_dataframe, x_0, config, charge=c)
++        return soc_bounds_constraint(u, horizon_dataframe, x_0, config, charge=c) + relax
+ 
+     def soc_jac(z):
+         u, c = split(z)
+@@ -560,6 +596,7 @@
+     res.max_balance_error_w = float(np.max(np.abs(power_balance_constraint(best_u, horizon_dataframe))))
+     res.min_soc_margin = float(np.min(soc_bounds_constraint(best_u, horizon_dataframe, x_0, config, charge=best_c)))
+     res.initial_soc = float(x_0)
++    res.recovery_steps = int(np.count_nonzero(relax_low) + np.count_nonzero(relax_up))
+     return res, best_cost, result_df
+ 
+ 
+diff -ruN a/src/settings.py b/src/settings.py
+--- a/src/settings.py	2026-10-24 09:18:42.990214630 +0200
++++ b/src/settings.py	2026-10-24 09:18:42.993055660 +0200
+@@ -50,6 +50,7 @@
+         "margin_window": "horizon",
+         "margin_steps": 0,
+         "soc_backoff": 0.0,
++        "soc_recovery": True,
+     },
+     "replay": {
+         "schedule_csv": "production_weekly.csv",
+diff -ruN a/src/tune_mpc.py b/src/tune_mpc.py
+--- a/src/tune_mpc.py	2026-10-24 09:18:42.979329943 +0200
++++ b/src/tune_mpc.py	2026-10-24 09:18:42.981495920 +0200
+@@ -289,6 +289,8 @@
+     parser.add_argument("--episodes", type=int, default=0, help="override tuning.episodes")
+     parser.add_argument("--episode-days", type=float, default=0, help="override tuning.episode_days")
+     parser.add_argument("--workers", type=int, default=0)
++    parser.add_argument("--resume", action="store_true",
++                        help="continue from <controller>_trials.csv if it was made with the same settings")
+     parser.add_argument("--set", action="append", default=[], metavar="SECTION.KEY=VALUE",
+                         help="tune for a modified scenario, e.g. --set SoC.E_capacity=72")
+     parser.add_argument("--select", choices=PRESETS, help="choose the Pareto point that replay.py --tuned uses")
+@@ -335,7 +337,28 @@
+                                             length_scale_bounds=(1e-2, 10)) + WhiteKernel(1e-3, (1e-8, 1e-1)),
+         normalize_y=True, n_restarts_optimizer=3, random_state=ts["random_state"],
+     )
+-    for trial in range(ts["trials"]):
++    trials_path = TUNING_DIR / f"{args.controller}_trials.csv"
++    meta_path = TUNING_DIR / f"{args.controller}_trials.meta.json"
++    meta = {"episodes": [[a.isoformat(), b.isoformat()] for a, b in windows], "scenario": scenario,
++            "objectives": objectives, "params": space.names}
++    same_run = meta_path.exists() and json.loads(meta_path.read_text(encoding="utf-8")) == json.loads(json.dumps(meta))
++    if args.resume and trials_path.exists() and not same_run:
++        print(f"not resuming: {trials_path.name} was made with other episodes or settings, starting over", flush=True)
++    if args.resume and trials_path.exists() and same_run:
++        prev = pd.read_csv(trials_path)
++        if list(prev.columns[3:3 + len(space.names)]) == space.names and len(prev):
++            for rec in prev.drop(columns=["pareto"], errors="ignore").to_dict("records"):
++                rec = {k: (None if isinstance(v, float) and np.isnan(v) and k == "scalarisation_weights" else v)
++                       for k, v in rec.items()}
++                rows.append(rec)
++                U.append(space.to_unit(np.array([rec[n] for n in space.names], dtype=float)))
++                F.append(objective_vector(rec, objectives))
++            # a fresh, reproducible stream for the remaining trials
++            rng = np.random.default_rng(ts["random_state"] + len(rows))
++            print(f"resuming after {len(rows)} trials from {trials_path}", flush=True)
++    TUNING_DIR.mkdir(parents=True, exist_ok=True)
++    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
++    for trial in range(len(rows), ts["trials"]):
+         weights = None
+         if trial == 0:
+             u, source = space.to_unit(space.current(cfg)), "current config"
+@@ -362,7 +385,7 @@
+                      **dict(zip(space.names, values)), **res, "seconds": time.perf_counter() - t0})
+         trials = pd.DataFrame(rows)
+         trials["pareto"] = pareto_mask(np.array(F))
+-        trials.to_csv(TUNING_DIR / f"{args.controller}_trials.csv", index=False)
++        trials.to_csv(trials_path, index=False)
+         kpis = " ".join(f"{o}={res[o]:.4g}" for o in objectives)
+         print(f"trial {trial + 1:>3}/{ts['trials']} {source:<20} {kpis} · front {int(trials['pareto'].sum())} "
+               f"· {_fmt_values(space.names, values)} · {time.perf_counter() - t0:.0f} s", flush=True)
+diff -ruN a/tests/test_cost_function.py b/tests/test_cost_function.py
+--- a/tests/test_cost_function.py	2026-10-24 09:18:42.995238524 +0200
++++ b/tests/test_cost_function.py	2026-10-24 09:18:42.997144342 +0200
+@@ -348,3 +348,33 @@
+     assert margin_window_steps(cfg) == 6
+     del cfg["mpc"]["margin_window"]                                      # older configs
+     assert margin_window_steps(cfg) == 6
++
++
++@pytest.mark.parametrize("charge_is_decision", [True, False])
++def test_start_below_the_band_recovers_instead_of_failing(config, charge_is_decision):
++    cfg = copy.deepcopy(config)
++    cfg["SoC"]["E_capacity"] = 72.0
++    cfg["mpc"].update(charge_is_decision=charge_is_decision, soc_chance_z=1.0)
++    # little renewable power: getting back into the band takes several steps
++    horizon = make_horizon(n=96, renewable_w=1.0, demand_w=24.0)
++    x0 = cfg["SoC"]["soc_min"] - 0.03
++    res, _, plan = optimize(horizon, cfg, x_0=x0)
++    assert res.success and res.recovery_steps > 0
++    soc = plan["SoC_opt"].to_numpy()
++    lo = plan["SoC_min_eff (%)"].to_numpy() / 100
++    back = int(np.argmax(soc >= lo - 1e-3))
++    assert back > 0 and (soc[back:] >= lo[back:] - 1e-3).all()      # back in the band, and it stays there
++    assert (plan["P_bat_dis_opt (W)"].to_numpy()[:back] <= 1e-2).all()  # no discharge while below it
++    # without the relaxation the same start is infeasible
++    cfg["mpc"]["soc_recovery"] = False
++    res_off, _, _ = optimize(horizon, cfg, x_0=x0)
++    assert not res_off.success
++
++
++def test_recovery_is_inactive_inside_the_band(config):
++    horizon = make_horizon(n=48, renewable_w=8.0, demand_w=24.0, seed=5)
++    res_on, cost_on, _ = optimize(horizon, config, x_0=0.5)
++    cfg = copy.deepcopy(config)
++    cfg["mpc"]["soc_recovery"] = False
++    res_off, cost_off, _ = optimize(horizon, cfg, x_0=0.5)
++    assert res_on.recovery_steps == 0 and cost_on == pytest.approx(cost_off)

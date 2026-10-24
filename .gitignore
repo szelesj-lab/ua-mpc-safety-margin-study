@@ -1,0 +1,18 @@
+# secrets
+.env
+*.key
+# LaTeX build files
+manuscript/*.aux
+manuscript/*.log
+manuscript/*.out
+manuscript/*.blg
+manuscript/*.fls
+manuscript/*.fdb_latexmk
+manuscript/*.synctex.gz
+manuscript/manuscript.pdf
+# Python
+__pycache__/
+*.pyc
+.venv/
+# local scratch
+*.tmp
